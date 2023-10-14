@@ -10,9 +10,14 @@ use bevy::{
 // Using the default 2D camera they correspond 1:1 with screen pixels.
 const PADDLE_SIZE: Vec3 = Vec3::new(120.0, 20.0, 0.0);
 const GAP_BETWEEN_PADDLE_AND_FLOOR: f32 = 60.0;
-const PADDLE_SPEED: f32 = 500.0;
 // How close can the paddle get to the wall
 const PADDLE_PADDING: f32 = 10.0;
+
+const GRAVITY: f32 = 9.8;
+const PADDLE_SPEED_MAX: f32 = 500.0;
+const PADDLE_MASS: f32 = 2.0;
+const PADDLE_FRICTION_COEFF: f32 = 50.0;
+const PADDLE_INPUT_FORCE: f32 = 4000.0;
 
 // We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
 const BALL_STARTING_POSITION: Vec3 = Vec3::new(0.0, -50.0, 1.0);
@@ -52,6 +57,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .insert_resource(Scoreboard { score: 0 })
         .insert_resource(ClearColor(BACKGROUND_COLOR))
+        .insert_resource(GlobalVolume::new(0.2))
         .add_event::<CollisionEvent>()
         // Configure how frequently our gameplay systems are run
         .insert_resource(FixedTime::new_from_secs(1.0 / 60.0))
@@ -77,6 +83,76 @@ struct Paddle;
 
 #[derive(Component)]
 struct Ball;
+
+#[derive(Component)]
+struct DynamicBody {
+    pub velocity: f32,
+    pub max_velocity: f32,
+    mass: f32,
+    /// Must be > 0
+    friction_coefficient: f32,
+}
+
+enum Direction {
+    Left,
+    Right,
+}
+
+impl From<Direction> for f32 {
+    fn from(dir: Direction) -> Self {
+        match dir {
+            Direction::Left => -1.0,
+            Direction::Right => 1.0,
+        }
+    }
+}
+
+impl DynamicBody {
+    fn new(velocity: f32, max_velocity: f32, friction_coefficient: f32, mass: f32) -> Self {
+        Self {
+            velocity,
+            max_velocity,
+            mass,
+            friction_coefficient: f32::abs(friction_coefficient),
+        }
+    }
+
+    fn update(&mut self, time_delta: f32) {
+        if self.friction_coefficient > 0.0 {
+            // Only apply friction if in motion
+            if self.velocity > 0.01 || self.velocity < -0.01 {
+                let normal_force = self.mass * GRAVITY;
+                let friction_force = self.friction_coefficient * normal_force;
+                // Add a component proportional to vel^2 to simulate "drag".
+                // Just need something that scales with velocity
+                self.velocity += (friction_force / self.mass
+                    + self.velocity * self.velocity * 0.01)
+                    * time_delta
+                    * -f32::from(self.direction());
+            } else {
+                self.velocity = 0.0;
+            }
+        }
+    }
+
+    fn apply_force(&mut self, force: f32, time_delta: f32) {
+        self.velocity += force / self.mass * time_delta;
+        self.velocity = f32::min(self.velocity, self.max_velocity);
+        self.velocity = f32::max(self.velocity, -self.max_velocity);
+    }
+
+    fn direction(&self) -> Direction {
+        match self.velocity > 0.0 {
+            true => Direction::Right,
+            _ => Direction::Left,
+        }
+    }
+
+    // TODO: don't assume collision with immovable object and handle all collision cases
+    fn register_collision(&mut self) {
+        self.velocity = 0.0;
+    }
+}
 
 #[derive(Component, Deref, DerefMut)]
 struct Velocity(Vec2);
@@ -203,6 +279,7 @@ fn setup(
         },
         Paddle,
         Collider,
+        DynamicBody::new(0.0, PADDLE_SPEED_MAX, PADDLE_FRICTION_COEFF, PADDLE_MASS),
     ));
 
     // Ball
@@ -310,29 +387,46 @@ fn setup(
 
 fn move_paddle(
     keyboard_input: Res<Input<KeyCode>>,
-    mut query: Query<&mut Transform, With<Paddle>>,
-    time_step: Res<FixedTime>,
+    mut query: Query<(&mut Transform, &mut DynamicBody), With<Paddle>>,
+    delta: Res<FixedTime>,
 ) {
-    let mut paddle_transform = query.single_mut();
-    let mut direction = 0.0;
+    let (mut paddle_transform, mut paddle_body) = query.single_mut();
 
-    if keyboard_input.pressed(KeyCode::Left) {
-        direction -= 1.0;
-    }
+    let delta = delta.period.as_secs_f32();
 
-    if keyboard_input.pressed(KeyCode::Right) {
-        direction += 1.0;
-    }
-
-    // Calculate the new horizontal paddle position based on player input
-    let new_paddle_position =
-        paddle_transform.translation.x + direction * PADDLE_SPEED * time_step.period.as_secs_f32();
+    paddle_body.update(delta);
 
     // Update the paddle position,
     // making sure it doesn't cause the paddle to leave the arena
     let left_bound = LEFT_WALL + WALL_THICKNESS / 2.0 + PADDLE_SIZE.x / 2.0 + PADDLE_PADDING;
     let right_bound = RIGHT_WALL - WALL_THICKNESS / 2.0 - PADDLE_SIZE.x / 2.0 - PADDLE_PADDING;
 
+    let wall_collision_direction: Option<Direction> = match paddle_transform.translation.x {
+        v if v >= right_bound => Some(Direction::Right),
+        v if v <= left_bound => Some(Direction::Left),
+        _ => None,
+    };
+
+    if wall_collision_direction.is_some() {
+        paddle_body.register_collision();
+    }
+
+    if keyboard_input.pressed(KeyCode::Left) {
+        match wall_collision_direction {
+            Some(Direction::Left) => (),
+            _ => paddle_body.apply_force(-PADDLE_INPUT_FORCE, delta),
+        }
+    }
+
+    if keyboard_input.pressed(KeyCode::Right) {
+        match wall_collision_direction {
+            Some(Direction::Right) => (),
+            _ => paddle_body.apply_force(PADDLE_INPUT_FORCE, delta),
+        }
+    }
+
+    // Calculate the new horizontal paddle position based on player input
+    let new_paddle_position = paddle_transform.translation.x + paddle_body.velocity * delta;
     paddle_transform.translation.x = new_paddle_position.clamp(left_bound, right_bound);
 }
 
